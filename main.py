@@ -74,6 +74,8 @@ def init_db():
         ("auto_precio", "REAL"),
         ("actualizado_en", "DATETIME"),
         ("actualizado_por", "TEXT"),
+        ("estatus_maestro", "TEXT"),     # etapa tal cual del panel maestro (nuevo..perdido)
+        ("fechas_estatus", "TEXT"),      # JSON {etapa: ISO} del panel maestro
     ])
     conn.execute("""
         CREATE TABLE IF NOT EXISTS lead_history (
@@ -397,7 +399,8 @@ async def leads(request: Request):
 @app.get("/estatus")
 async def catalogo():
     """Catalogo de estatus y motivos (publico, sin datos de clientes)."""
-    return {"estatus": ESTATUS, "motivos": MOTIVOS}
+    return {"estatus": ESTATUS, "motivos": MOTIVOS, "estatus_maestro": list(MAESTRO_A_RAILWAY),
+            "maestro_a_railway": MAESTRO_A_RAILWAY}
 
 
 # ---------- Panel: cambiar estatus a mano (temporal, hasta que el panel maestro este listo) ----------
@@ -655,6 +658,18 @@ def _procesar_evento(conn, ev):
             lead = None
     if lead is None:
         lead = _lead_by_phone(conn, phone)
+    creado = False
+    if lead is None:
+        # Cliente capturado en el maestro sin lead previo: se crea el lead (origen del payload o carsmid).
+        org = str(payload.get("origen") or "").strip().lower()
+        org = org if org in ("carsmid", "tuyo") else "carsmid"
+        cur = conn.execute(
+            "INSERT INTO leads (phone, name, timestamp, message, campaign, result, origen, ultimo_contacto, actualizado_por) "
+            "VALUES (?, ?, ?, ?, ?, 'nuevo', ?, CURRENT_TIMESTAMP, 'panel_maestro')",
+            (phone, str(payload.get("nombre") or "").strip() or None, ts, "Alta desde panel maestro",
+             str(payload.get("campana") or "").strip() or None, org))
+        lead = conn.execute("SELECT * FROM leads WHERE id = ?", (cur.lastrowid,)).fetchone()
+        creado = True
     lead_id = lead["id"] if lead else None
     conn.execute("INSERT INTO maestro_eventos (event_id, phone, lead_id, event, payload, ts) VALUES (?, ?, ?, ?, ?, ?)",
                  (event_id, phone, lead_id, event, json.dumps(payload, ensure_ascii=False), ts))
@@ -680,6 +695,11 @@ def _procesar_evento(conn, ev):
         _guardar_sin_lead(conn, "maestro:" + event, phone, ev)
         return {"ok": True, "matched": False, "telefono": phone, "event": event}
 
+    em = str(snap.get("estatus") or "").strip().lower()
+    if em in MAESTRO_A_RAILWAY:
+        conn.execute("UPDATE leads SET estatus_maestro = ? WHERE id = ?", (em, lead_id))
+    if isinstance(snap.get("fechas_estatus"), dict):
+        conn.execute("UPDATE leads SET fechas_estatus = ? WHERE id = ?", (json.dumps(snap["fechas_estatus"], ensure_ascii=False), lead_id))
     asesor = str(snap.get("asesor") or "").strip() or None
     est = MAESTRO_A_RAILWAY.get(str(snap.get("estatus") or "").strip().lower())
     if est:
@@ -720,10 +740,11 @@ def _procesar_evento(conn, ev):
             conn.execute("UPDATE ventas SET anulada = 1 WHERE venta_id = ?", (vid,))
         else:
             conn.execute("UPDATE ventas SET anulada = 1 WHERE id = (SELECT MAX(id) FROM ventas WHERE lead_id = ? AND COALESCE(anulada, 0) = 0)", (lead_id,))
-    return {"ok": True, "matched": True, "lead_id": lead_id, "telefono": phone, "event": event}
+    return {"ok": True, "matched": True, "lead_creado": creado, "lead_id": lead_id, "telefono": phone, "event": event}
 
 
 @app.post("/maestro/evento")
+@app.post("/maestro/eventos")
 async def maestro_evento(request: Request):
     """Bearer MAESTRO_TOKEN o VENTAS_TOKEN. Body: un evento {event, payload, ts?, id?},
     una lista de eventos, o {"eventos": [...]}. payload.telefono (10 digitos) es la llave."""
@@ -822,3 +843,185 @@ async def del_gasto(gasto_id: int, request: Request):
     if not n:
         return JSONResponse({"detail": "Not found"}, status_code=404)
     return {"deleted": gasto_id}
+
+
+# ---------- Leads nuevos para importar al panel maestro ----------
+@app.get("/leads/nuevos")
+async def leads_nuevos(request: Request, desde: str = "", desde_id: int = 0):
+    """Bearer MAESTRO_TOKEN o VENTAS_TOKEN. Leads (uno por telefono) creados despues de `desde`
+    (ISO o epoch ms) o con id > desde_id. Maximo 500, del mas viejo al mas nuevo."""
+    if not _maestro_ok(request):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    corte = "1970-01-01 00:00:00"
+    d = (desde or "").strip()
+    if d:
+        try:
+            if d.isdigit():
+                n = int(d)
+                dt = datetime.fromtimestamp(n / 1000 if n > 10**11 else n, tz=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(d.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            corte = dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return JSONResponse({"detail": "desde invalido (ISO o epoch ms)"}, status_code=400)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute("""
+        SELECT l.id, l.phone AS telefono, l.name AS nombre, l.origen, l.campaign AS campana,
+               l.created_at AS fecha, l.message AS mensaje, l.anuncio_id, l.numero_destino,
+               l.result AS estatus, l.estatus_maestro, l.auto_interes
+        FROM leads l
+        WHERE l.id = (SELECT MAX(id) FROM leads l2 WHERE l2.phone = l.phone)
+          AND l.created_at > ? AND l.id > ? AND length(COALESCE(l.phone, '')) = 10
+        ORDER BY l.created_at, l.id LIMIT 500""", (corte, desde_id))]
+    conn.close()
+    for r in rows:
+        if r["fecha"] and "T" not in r["fecha"]:
+            r["fecha"] = r["fecha"].replace(" ", "T") + "Z"
+    return {"leads": rows, "total": len(rows),
+            "hasta": rows[-1]["fecha"] if rows else (d or None)}
+
+
+# ---------- Metricas (Bearer API_TOKEN) ----------
+ETAPAS_MAESTRO = ["nuevo", "contactado", "cita", "visito", "negociacion", "credito", "apartado", "vendido", "perdido"]
+
+
+def _filtro_leads(desde, hasta, campana, origen):
+    w, p = ["l.id = (SELECT MAX(id) FROM leads l2 WHERE l2.phone = l.phone)"], []
+    if desde:
+        w.append("date(l.created_at) >= date(?)"); p.append(desde)
+    if hasta:
+        w.append("date(l.created_at) <= date(?)"); p.append(hasta)
+    if campana:
+        w.append("COALESCE(l.campaign, '') = ?"); p.append(campana)
+    if origen:
+        w.append("COALESCE(l.origen, '') = ?"); p.append(origen)
+    return " AND ".join(w), p
+
+
+def _iso(s):
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00").replace(" ", "T"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _leads_metricas(desde, hasta, campana, origen):
+    where, p = _filtro_leads(desde, hasta, campana, origen)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute(f"SELECT l.* FROM leads l WHERE {where}", p)]
+    fotos = {r["phone"]: _loads(r["payload"]) or {} for r in conn.execute("SELECT phone, payload FROM maestro")}
+    ventas = [dict(r) for r in conn.execute("SELECT * FROM ventas WHERE COALESCE(anulada, 0) = 0")]
+    gastos = [dict(r) for r in conn.execute("SELECT * FROM gasto")]
+    conn.close()
+    for r in rows:
+        r["_m"] = fotos.get(r["phone"], {})
+    return rows, ventas, gastos
+
+
+def _etapa(r):
+    em = r.get("estatus_maestro") or (r["_m"].get("estatus") if r["_m"] else None)
+    if em in ETAPAS_MAESTRO:
+        return em
+    inv = {"cita_agendada": "cita", "en_proceso": "negociacion", "en_tramite": "credito", "cancelado": "perdido",
+           "no_contesta": "contactado", "vendido": "vendido", "contactado": "contactado", "nuevo": "nuevo"}
+    return inv.get(r.get("result") or "nuevo", "nuevo")
+
+
+@app.get("/metricas/embudo")
+async def metricas_embudo(request: Request, desde: str = "", hasta: str = "", campana: str = "", origen: str = ""):
+    """Cuantos leads estan en cada etapa y cuantos alcanzaron cada etapa, mas dias promedio entre etapas."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    rows, _, _ = _leads_metricas(desde, hasta, campana, origen)
+    actual = {e: 0 for e in ETAPAS_MAESTRO}
+    alcanzo = {e: 0 for e in ETAPAS_MAESTRO}
+    dias = {}
+    for r in rows:
+        et = _etapa(r)
+        actual[et] += 1
+        fe = r["_m"].get("fechas_estatus") if isinstance(r["_m"].get("fechas_estatus"), dict) else (_loads(r.get("fechas_estatus")) or {})
+        for e in ETAPAS_MAESTRO:
+            implicito = et != "perdido" and e != "perdido" and ETAPAS_MAESTRO.index(e) <= ETAPAS_MAESTRO.index(et)
+            if fe.get(e) or e == et or e == "nuevo" or implicito:
+                alcanzo[e] += 1
+        seq = [e for e in ETAPAS_MAESTRO if fe.get(e)]
+        for a, b in zip(seq, seq[1:]):
+            ta, tb = _iso(fe[a]), _iso(fe[b])
+            if ta and tb and tb >= ta:
+                dias.setdefault(f"{a}->{b}", []).append((tb - ta).total_seconds() / 86400)
+    total = len(rows)
+    return {"total": total,
+            "etapas": [{"etapa": e, "actual": actual[e], "alcanzaron": alcanzo[e],
+                        "pct": round(alcanzo[e] * 100 / total, 1) if total else 0} for e in ETAPAS_MAESTRO],
+            "dias_entre_etapas": {k: round(sum(v) / len(v), 2) for k, v in dias.items()}}
+
+
+@app.get("/metricas/respuesta")
+async def metricas_respuesta(request: Request, desde: str = "", hasta: str = "", campana: str = "", origen: str = ""):
+    """Tiempo de primera respuesta (tiempo_respuesta_min del maestro): promedio, mediana, p90 y por asesor."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    rows, _, _ = _leads_metricas(desde, hasta, campana, origen)
+    vals, por_asesor, sin = [], {}, 0
+    for r in rows:
+        v = _num(r["_m"].get("tiempo_respuesta_min"))
+        if v is None:
+            sin += 1
+            continue
+        vals.append(v)
+        por_asesor.setdefault(r["_m"].get("asesor") or r.get("vendedor") or "sin_asesor", []).append(v)
+
+    def st(xs):
+        xs = sorted(xs)
+        if not xs:
+            return {"n": 0, "promedio_min": None, "mediana_min": None, "p90_min": None}
+        return {"n": len(xs), "promedio_min": round(sum(xs) / len(xs), 1), "mediana_min": xs[len(xs) // 2],
+                "p90_min": xs[min(len(xs) - 1, int(len(xs) * 0.9))]}
+    return {**st(vals), "sin_dato": sin, "por_asesor": {k: st(v) for k, v in por_asesor.items()},
+            "rangos": {"<=15": sum(1 for v in vals if v <= 15), "15-60": sum(1 for v in vals if 15 < v <= 60),
+                       "60-1440": sum(1 for v in vals if 60 < v <= 1440), ">1440": sum(1 for v in vals if v > 1440)}}
+
+
+@app.get("/metricas/campanas")
+async def metricas_campanas(request: Request, desde: str = "", hasta: str = "", campana: str = "", origen: str = ""):
+    """Por campana: leads, ventas, monto vendido, gasto (que traslapa el periodo), costo por lead y por venta."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    rows, ventas, gastos = _leads_metricas(desde, hasta, campana, origen)
+    ids = {r["id"]: r for r in rows}
+    phones = {r["phone"]: r for r in rows}
+    out = {}
+
+    def c(nombre):
+        return out.setdefault(nombre or "sin_campana", {"campana": nombre or "sin_campana", "leads": 0, "ventas": 0,
+                                                        "monto": 0.0, "gasto": 0.0})
+    for r in rows:
+        c(r["_m"].get("campana") or r.get("campaign"))["leads"] += 1
+    for v in ventas:
+        r = ids.get(v.get("lead_id")) or phones.get(v.get("phone"))
+        if not r:
+            continue
+        x = c(r["_m"].get("campana") or r.get("campaign"))
+        x["ventas"] += 1
+        x["monto"] += _num(v.get("monto")) or 0
+    for g in gastos:
+        if desde and g["hasta"] < desde:
+            continue
+        if hasta and g["desde"] > hasta:
+            continue
+        if campana and g["campana"] != campana:
+            continue
+        c(g["campana"])["gasto"] += g["monto"] or 0
+    res = []
+    for x in out.values():
+        x["costo_por_lead"] = round(x["gasto"] / x["leads"], 2) if x["leads"] and x["gasto"] else None
+        x["costo_por_venta"] = round(x["gasto"] / x["ventas"], 2) if x["ventas"] and x["gasto"] else None
+        x["conversion_pct"] = round(x["ventas"] * 100 / x["leads"], 1) if x["leads"] else 0
+        res.append(x)
+    res.sort(key=lambda x: (-x["leads"], x["campana"]))
+    return {"campanas": res, "nota": "El gasto cuenta completo si su periodo se traslapa con el filtro."}
