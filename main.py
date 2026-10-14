@@ -18,7 +18,8 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-VERIFY_TOKEN = "carsmid_wh_2026_x7k9"
+# Token de verificacion del webhook de Meta: se configura en Railway (VERIFY_TOKEN).
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "leads.db")
 
 def init_db():
@@ -40,6 +41,31 @@ def init_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(leads)")]
     if "origen" not in cols:
         conn.execute("ALTER TABLE leads ADD COLUMN origen TEXT DEFAULT 'carsmid'")
+    # Historial de cambios de resultado (lo llena PATCH /leads/{id})
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lead_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL,
+            old_result TEXT,
+            new_result TEXT,
+            changed_by TEXT,
+            changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Ventas que llegan del panel maestro (POST /ventas)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ventas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            venta_id TEXT UNIQUE,
+            phone TEXT,
+            auto TEXT,
+            monto REAL,
+            comision REAL,
+            fecha TEXT,
+            lead_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -77,9 +103,9 @@ init_db()
 async def verify(request: Request):
     params = request.query_params
     mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
+    token = params.get("hub.verify_token") or ""
     challenge = params.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
+    if mode == "subscribe" and VERIFY_TOKEN and hmac.compare_digest(token.encode(), VERIFY_TOKEN.encode()):
         return PlainTextResponse(challenge)
     raise HTTPException(status_code=403, detail="Verification failed")
 
@@ -146,5 +172,132 @@ async def leads(request: Request):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = [dict(r) for r in conn.execute("SELECT * FROM leads ORDER BY id DESC")]
+    conn.close()
+    return rows
+
+
+# ---------- Panel: helpers ----------
+RESULTS = {"", "contactado", "cita_agendada", "vendido", "no_interesado", "no_contesto"}
+
+
+def _bearer_ok(request: Request, env_name: str) -> bool:
+    token = _env(env_name)
+    auth = request.headers.get("authorization", "")
+    return bool(token) and hmac.compare_digest(auth.encode(), ("Bearer " + token).encode())
+
+
+def _set_result(conn, lead_id, new_result, changed_by):
+    """Cambia el resultado de un lead y deja registro en lead_history."""
+    row = conn.execute("SELECT result FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    if row is None:
+        return False
+    old = row[0] or ""
+    if old != new_result:
+        conn.execute("UPDATE leads SET result = ? WHERE id = ?", (new_result or None, lead_id))
+        conn.execute(
+            "INSERT INTO lead_history (lead_id, old_result, new_result, changed_by) VALUES (?, ?, ?, ?)",
+            (lead_id, old, new_result, changed_by),
+        )
+    return True
+
+
+# ---------- Panel: cambiar resultado ----------
+@app.patch("/leads/{lead_id}")
+async def update_lead(lead_id: int, request: Request):
+    """Body JSON {result, password}. Bearer API_TOKEN.
+    200 lead actualizado · 400 resultado invalido · 401 sin token o contrasena incorrecta · 404 no existe."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    password = str(data.get("password", ""))
+    pass_env = _env("LOGIN_PASS")
+    if not (password and pass_env and hmac.compare_digest(password.encode(), pass_env.encode())):
+        return JSONResponse({"detail": "Invalid password"}, status_code=401)
+    new_result = str(data.get("result") or "").strip().lower()
+    if new_result not in RESULTS:
+        return JSONResponse({"detail": "Invalid result", "allowed": sorted(RESULTS)}, status_code=400)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        if not _set_result(conn, lead_id, new_result, _env("LOGIN_USER") or "panel"):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        conn.commit()
+        return dict(conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+@app.get("/leads/{lead_id}/history")
+async def lead_history(lead_id: int, request: Request):
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM lead_history WHERE lead_id = ? ORDER BY id DESC", (lead_id,))]
+    conn.close()
+    return rows
+
+
+# ---------- Ventas (Cloudflare Worker del panel maestro) ----------
+@app.post("/ventas")
+async def create_venta(request: Request):
+    """Bearer VENTAS_TOKEN. Body JSON {venta_id?, phone, auto?, monto?, comision?, fecha?}.
+    Hace match con el lead mas reciente del mismo numero (10 digitos) y lo marca como vendido.
+    Si llega dos veces el mismo venta_id, no se duplica."""
+    if not _env("VENTAS_TOKEN"):
+        return JSONResponse({"detail": "Ventas not configured"}, status_code=500)
+    if not _bearer_ok(request, "VENTAS_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    phone = normalize_phone(data.get("phone"))
+    if len(phone) != 10:
+        return JSONResponse({"detail": "phone must have 10 digits"}, status_code=400)
+
+    def num(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    venta_id = str(data.get("venta_id") or "").strip() or None
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if venta_id:
+            prev = conn.execute("SELECT id, lead_id FROM ventas WHERE venta_id = ?", (venta_id,)).fetchone()
+            if prev:
+                return {"id": prev[0], "venta_id": venta_id, "matched": prev[1] is not None,
+                        "lead_id": prev[1], "duplicate": True}
+        lead = conn.execute(
+            "SELECT id FROM leads WHERE phone = ? ORDER BY id DESC LIMIT 1", (phone,)).fetchone()
+        lead_id = lead[0] if lead else None
+        cur = conn.execute(
+            "INSERT INTO ventas (venta_id, phone, auto, monto, comision, fecha, lead_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (venta_id, phone, str(data.get("auto") or "") or None, num(data.get("monto")),
+             num(data.get("comision")), str(data.get("fecha") or "") or None, lead_id),
+        )
+        if lead_id is not None:
+            _set_result(conn, lead_id, "vendido", "panel_maestro")
+        conn.commit()
+        return {"id": cur.lastrowid, "venta_id": venta_id, "matched": lead_id is not None,
+                "lead_id": lead_id, "duplicate": False}
+    finally:
+        conn.close()
+
+
+@app.get("/ventas")
+async def list_ventas(request: Request):
+    """Bearer API_TOKEN. Ventas registradas; lead_id vacio = venta sin lead."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute("SELECT * FROM ventas ORDER BY id DESC")]
     conn.close()
     return rows
