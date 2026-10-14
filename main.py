@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import urllib.request
+from datetime import datetime, timezone
 
 app = FastAPI()
 
@@ -16,7 +17,7 @@ CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://prueb
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -66,7 +67,11 @@ def init_db():
         ("motivo", "TEXT"),              # motivo de cancelacion
         ("nota_motivo", "TEXT"),
         ("vendedor", "TEXT"),
-        ("auto_interes", "TEXT"),
+        ("auto_interes", "TEXT"),        # texto armado: "Nissan Versa 2020"
+        ("auto_marca", "TEXT"),
+        ("auto_modelo", "TEXT"),
+        ("auto_anio", "INTEGER"),
+        ("auto_precio", "REAL"),
         ("actualizado_en", "DATETIME"),
         ("actualizado_por", "TEXT"),
     ])
@@ -122,6 +127,40 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Panel maestro: ultima foto del cliente (por telefono) y bitacora de eventos.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS maestro (
+            phone TEXT PRIMARY KEY,
+            lead_id INTEGER,
+            payload TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS maestro_eventos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT UNIQUE,
+            phone TEXT,
+            lead_id INTEGER,
+            event TEXT,
+            payload TEXT,
+            ts TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Gasto de Meta Ads capturado a mano (por campana y periodo).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gasto (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campana TEXT NOT NULL,
+            desde TEXT NOT NULL,
+            hasta TEXT NOT NULL,
+            monto REAL NOT NULL,
+            creado_por TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    _add_cols(conn, "ventas", [("anulada", "INTEGER DEFAULT 0")])
     # Pasar los resultados viejos a los estatus nuevos.
     conn.execute("UPDATE leads SET result = 'nuevo' WHERE result IS NULL OR result = ''")
     for old, new in MAPEO_VIEJO.items():
@@ -171,8 +210,8 @@ def _lead_by_phone(conn, phone):
     return row
 
 
-def _set_result(conn, lead_id, new_result, changed_by, source="panel", motivo=None):
-    """Cambia el estatus de un lead y deja registro en lead_history."""
+def _set_result(conn, lead_id, new_result, changed_by, source="panel", motivo=None, record=True):
+    """Cambia el estatus de un lead y deja registro en lead_history (record=False si ya queda en maestro_eventos)."""
     row = conn.execute("SELECT result FROM leads WHERE id = ?", (lead_id,)).fetchone()
     if row is None:
         return False
@@ -183,7 +222,8 @@ def _set_result(conn, lead_id, new_result, changed_by, source="panel", motivo=No
             (new_result, changed_by, lead_id))
         if new_result != "cancelado":
             conn.execute("UPDATE leads SET motivo = NULL, nota_motivo = NULL WHERE id = ?", (lead_id,))
-        conn.execute(
+        if record:
+            conn.execute(
             "INSERT INTO lead_history (lead_id, old_result, new_result, changed_by, source, motivo) VALUES (?, ?, ?, ?, ?, ?)",
             (lead_id, old, new_result, changed_by, source, motivo),
         )
@@ -336,10 +376,21 @@ async def leads(request: Request):
                v.comision AS sale_comision, v.vendedor AS sale_vendedor,
                v.forma_pago AS sale_forma_pago, v.fecha AS sale_fecha
         FROM leads l
-        LEFT JOIN ventas v ON v.id = (SELECT MAX(id) FROM ventas WHERE lead_id = l.id)
+        LEFT JOIN ventas v ON v.id = (SELECT MAX(id) FROM ventas WHERE lead_id = l.id AND COALESCE(anulada, 0) = 0)
         WHERE l.id = (SELECT MAX(id) FROM leads l2 WHERE l2.phone = l.phone)
         ORDER BY l.id DESC""")]
+    # Datos del panel maestro: ultima foto (maestro) y ultimos 50 eventos (maestro_eventos).
+    fotos = {r["phone"]: r["payload"] for r in conn.execute("SELECT phone, payload FROM maestro")}
+    eventos = {}
+    for r in conn.execute("SELECT phone, event, payload, ts FROM maestro_eventos ORDER BY ts DESC, id DESC"):
+        lst = eventos.setdefault(r["phone"], [])
+        if len(lst) < 50:
+            lst.append({"event": r["event"], "payload": _loads(r["payload"]), "ts": r["ts"]})
     conn.close()
+    for row in rows:
+        if row["phone"] in fotos:
+            row["maestro"] = _loads(fotos[row["phone"]])
+            row["maestro_eventos"] = list(reversed(eventos.get(row["phone"], [])))
     return rows
 
 
@@ -393,6 +444,13 @@ async def lead_history(lead_id: int, request: Request):
 
 
 # ---------- Panel maestro (Cloudflare Worker) -> backend ----------
+def _num(v):
+    try:
+        return float(str(v).replace(",", "").replace("$", "")) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _guardar_sin_lead(conn, tipo, phone, data):
     conn.execute("INSERT INTO avisos_sin_lead (tipo, phone, payload) VALUES (?, ?, ?)",
                  (tipo, phone, json.dumps(data, ensure_ascii=False)))
@@ -401,8 +459,10 @@ def _guardar_sin_lead(conn, tipo, phone, data):
 @app.post("/estatus")
 async def recibir_estatus(request: Request):
     """Bearer VENTAS_TOKEN (token del panel maestro).
-    Body JSON {telefono, estatus, motivo?, nota?, cambiado_por?, vendedor?, auto_interes?, nombre?, campana?}.
-    Refleja el estatus del panel maestro en el lead de ese telefono."""
+    Body JSON {telefono, estatus?, motivo?, nota?, cambiado_por?, vendedor?, nombre?, campana?,
+               auto?: {marca, modelo, anio, precio}}.
+    Refleja en el lead de ese telefono el estatus y el auto de interes que tiene el panel maestro.
+    Sin "estatus" solo actualiza los demas datos (por ejemplo, al asignar el auto)."""
     if not _env("VENTAS_TOKEN"):
         return JSONResponse({"detail": "Not configured"}, status_code=500)
     if not _bearer_ok(request, "VENTAS_TOKEN"):
@@ -414,8 +474,8 @@ async def recibir_estatus(request: Request):
     phone = normalize_phone(data.get("telefono") or data.get("phone"))
     if len(phone) != 10:
         return JSONResponse({"detail": "telefono must have 10 digits"}, status_code=400)
-    estatus = str(data.get("estatus") or "").strip().lower()
-    if estatus not in ESTATUS:
+    estatus = str(data.get("estatus") or "").strip().lower() or None
+    if estatus is not None and estatus not in ESTATUS:
         return JSONResponse({"detail": "Invalid estatus", "allowed": ESTATUS}, status_code=400)
     motivo = str(data.get("motivo") or "").strip().lower() or None
     nota = str(data.get("nota") or "").strip() or None
@@ -437,17 +497,30 @@ async def recibir_estatus(request: Request):
             conn.commit()
             return {"matched": False, "telefono": phone}
         lead_id = lead["id"]
-        _set_result(conn, lead_id, estatus, quien, source="panel_maestro", motivo=motivo)
-        extras = {"motivo": motivo, "nota_motivo": nota}
-        for campo, clave in (("vendedor", "vendedor"), ("auto_interes", "auto_interes"),
-                             ("name", "nombre"), ("campaign", "campana")):
+        extras = {}
+        if estatus:
+            _set_result(conn, lead_id, estatus, quien, source="panel_maestro", motivo=motivo)
+            extras.update({"motivo": motivo, "nota_motivo": nota})
+        for campo, clave in (("vendedor", "vendedor"), ("name", "nombre"), ("campaign", "campana")):
             v = str(data.get(clave) or "").strip()
             if v:
                 extras[campo] = v
+        auto = data.get("auto") if isinstance(data.get("auto"), dict) else {}
+        marca = str(auto.get("marca") or data.get("auto_marca") or "").strip() or None
+        modelo = str(auto.get("modelo") or data.get("auto_modelo") or "").strip() or None
+        anio = _num(auto.get("anio", auto.get("año", data.get("auto_anio"))))
+        precio = _num(auto.get("precio", data.get("auto_precio")))
+        texto = str(data.get("auto_interes") or "").strip() or None
+        if marca or modelo or anio or precio or texto:
+            extras.update({"auto_marca": marca, "auto_modelo": modelo,
+                           "auto_anio": int(anio) if anio else None, "auto_precio": precio,
+                           "auto_interes": texto or " ".join(str(x) for x in (marca, modelo, int(anio) if anio else None) if x) or None})
+        if not extras:
+            return JSONResponse({"detail": "Nothing to update"}, status_code=400)
         sets = ", ".join(f"{k} = ?" for k in extras)
         conn.execute(f"UPDATE leads SET {sets} WHERE id = ?", (*extras.values(), lead_id))
         conn.commit()
-        return {"matched": True, "telefono": phone, "lead_id": lead_id, "estatus": estatus}
+        return {"matched": True, "telefono": phone, "lead_id": lead_id, "estatus": estatus or lead["result"]}
     finally:
         conn.close()
 
@@ -536,3 +609,216 @@ async def list_entradas(request: Request, desde_id: int = 0):
         "SELECT * FROM entradas WHERE id > ? ORDER BY id LIMIT 500", (desde_id,))]
     conn.close()
     return rows
+
+
+# ---------- Panel maestro: eventos (via Cloudflare) ----------
+EVENTOS = {"cliente_creado", "cliente_actualizado", "estatus_cambiado", "precio_ajustado", "venta", "venta_anulada"}
+# Embudo del maestro -> estatus de Railway (para historial, filtros y metricas).
+MAESTRO_A_RAILWAY = {"nuevo": "nuevo", "contactado": "contactado", "cita": "cita_agendada", "visito": "en_proceso",
+                     "negociacion": "en_proceso", "credito": "en_tramite", "apartado": "en_tramite",
+                     "vendido": "vendido", "perdido": "cancelado"}
+PERDIDA_A_MOTIVO = {"precio": "precio", "credito_rechazado": "no_califico_credito", "compro_otro_lado": "compro_otro_lugar",
+                    "no_hay_unidad": "auto_vendido", "solo_cotizaba": "solo_cotizando"}
+
+
+def _loads(txt):
+    try:
+        return json.loads(txt) if txt else None
+    except Exception:
+        return None
+
+
+def _maestro_ok(request: Request) -> bool:
+    return _bearer_ok(request, "MAESTRO_TOKEN") or _bearer_ok(request, "VENTAS_TOKEN")
+
+
+def _procesar_evento(conn, ev):
+    """Guarda un evento del maestro, actualiza la foto del cliente y refleja estatus, auto y venta en el lead."""
+    if not isinstance(ev, dict):
+        return {"ok": False, "detail": "evento invalido"}
+    event = str(ev.get("event") or ev.get("evento") or "").strip().lower()
+    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+    if event not in EVENTOS:
+        return {"ok": False, "detail": "event invalido", "allowed": sorted(EVENTOS)}
+    phone = normalize_phone(payload.get("telefono") or payload.get("phone") or ev.get("telefono"))
+    if len(phone) != 10:
+        return {"ok": False, "detail": "telefono must have 10 digits"}
+    ts = str(ev.get("ts") or payload.get("updated_at") or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    event_id = str(ev.get("id") or ev.get("event_id") or payload.get("event_id") or "").strip() or None
+    if event_id and conn.execute("SELECT 1 FROM maestro_eventos WHERE event_id = ?", (event_id,)).fetchone():
+        return {"ok": True, "duplicate": True, "event_id": event_id}
+
+    lead = None
+    if payload.get("lead_id") not in (None, ""):
+        lead = conn.execute("SELECT * FROM leads WHERE id = ?", (payload.get("lead_id"),)).fetchone()
+        if lead is not None and lead["phone"] != phone:
+            lead = None
+    if lead is None:
+        lead = _lead_by_phone(conn, phone)
+    lead_id = lead["id"] if lead else None
+    conn.execute("INSERT INTO maestro_eventos (event_id, phone, lead_id, event, payload, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                 (event_id, phone, lead_id, event, json.dumps(payload, ensure_ascii=False), ts))
+
+    row = conn.execute("SELECT payload FROM maestro WHERE phone = ?", (phone,)).fetchone()
+    snap = _loads(row["payload"]) if row else None
+    snap = snap or {}
+    propios = {"de", "a", "motivo", "monto", "comision", "venta_id"}
+    snap.update({k: v for k, v in payload.items() if k not in propios})
+    if event == "estatus_cambiado" and "estatus" not in payload and payload.get("a"):
+        snap["estatus"] = payload["a"]
+    if event == "precio_ajustado" and "precio_ofrecido" not in payload and payload.get("a") not in (None, ""):
+        snap["precio_ofrecido"] = _num(payload.get("a"))
+    if event == "venta":
+        snap["estatus"] = "vendido"
+    if event == "venta_anulada":
+        snap["estatus"] = payload.get("estatus") or "negociacion"
+    conn.execute("INSERT INTO maestro (phone, lead_id, payload, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+                 "ON CONFLICT(phone) DO UPDATE SET lead_id = COALESCE(excluded.lead_id, maestro.lead_id), payload = excluded.payload, updated_at = CURRENT_TIMESTAMP",
+                 (phone, lead_id, json.dumps(snap, ensure_ascii=False)))
+
+    if lead_id is None:
+        _guardar_sin_lead(conn, "maestro:" + event, phone, ev)
+        return {"ok": True, "matched": False, "telefono": phone, "event": event}
+
+    asesor = str(snap.get("asesor") or "").strip() or None
+    est = MAESTRO_A_RAILWAY.get(str(snap.get("estatus") or "").strip().lower())
+    if est:
+        motivo = None
+        if est == "cancelado":
+            motivo = PERDIDA_A_MOTIVO.get(str(snap.get("motivo_perdida") or ""), "otro")
+        _set_result(conn, lead_id, est, asesor or "panel_maestro", source="panel_maestro", motivo=motivo, record=False)
+        if motivo:
+            nota = None if motivo != "otro" else str(snap.get("motivo_perdida") or "otro")
+            conn.execute("UPDATE leads SET motivo = ?, nota_motivo = ? WHERE id = ?", (motivo, nota, lead_id))
+    extras = {}
+    if asesor:
+        extras["vendedor"] = asesor
+    if str(snap.get("nombre") or "").strip():
+        extras["name"] = str(snap["nombre"]).strip()
+    if str(snap.get("campana") or "").strip():
+        extras["campaign"] = str(snap["campana"]).strip()
+    auto = snap.get("auto_interes") if isinstance(snap.get("auto_interes"), dict) else None
+    if auto:
+        anio = _num(auto.get("anio"))
+        extras.update({"auto_marca": auto.get("marca"), "auto_modelo": auto.get("modelo"), "auto_anio": int(anio) if anio else None,
+                       "auto_interes": auto.get("vehiculo") or " ".join(str(x) for x in (auto.get("marca"), auto.get("modelo"), int(anio) if anio else None) if x) or None})
+    precio = _num(snap.get("precio_ofrecido")) or _num(snap.get("precio_lista"))
+    if precio:
+        extras["auto_precio"] = precio
+    if extras:
+        conn.execute("UPDATE leads SET " + ", ".join(k + " = ?" for k in extras) + " WHERE id = ?", (*extras.values(), lead_id))
+
+    if event == "venta":
+        venta_id = str(payload.get("venta_id") or event_id or "").strip() or None
+        if not (venta_id and conn.execute("SELECT 1 FROM ventas WHERE venta_id = ?", (venta_id,)).fetchone()):
+            conn.execute("INSERT INTO ventas (venta_id, phone, auto, monto, comision, fecha, lead_id, forma_pago, vendedor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (venta_id, phone, extras.get("auto_interes"), _num(payload.get("monto")) or _num(snap.get("precio_ofrecido")),
+                          _num(payload.get("comision")), (ts or "")[:10] or None, lead_id, snap.get("forma_pago"), asesor))
+    if event == "venta_anulada":
+        vid = str(payload.get("venta_id") or "").strip()
+        if vid:
+            conn.execute("UPDATE ventas SET anulada = 1 WHERE venta_id = ?", (vid,))
+        else:
+            conn.execute("UPDATE ventas SET anulada = 1 WHERE id = (SELECT MAX(id) FROM ventas WHERE lead_id = ? AND COALESCE(anulada, 0) = 0)", (lead_id,))
+    return {"ok": True, "matched": True, "lead_id": lead_id, "telefono": phone, "event": event}
+
+
+@app.post("/maestro/evento")
+async def maestro_evento(request: Request):
+    """Bearer MAESTRO_TOKEN o VENTAS_TOKEN. Body: un evento {event, payload, ts?, id?},
+    una lista de eventos, o {"eventos": [...]}. payload.telefono (10 digitos) es la llave."""
+    if not (_env("MAESTRO_TOKEN") or _env("VENTAS_TOKEN")):
+        return JSONResponse({"detail": "Not configured"}, status_code=500)
+    if not _maestro_ok(request):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    lote = data if isinstance(data, list) else (data.get("eventos") if isinstance(data, dict) and isinstance(data.get("eventos"), list) else [data])
+    if len(lote) > 500:
+        return JSONResponse({"detail": "max 500 eventos"}, status_code=400)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        res = [_procesar_evento(conn, ev) for ev in lote]
+        conn.commit()
+    finally:
+        conn.close()
+    if len(lote) == 1:
+        return res[0] if res[0].get("ok") else JSONResponse(res[0], status_code=400)
+    return {"resultados": res}
+
+
+@app.get("/leads/{lead_id}/maestro")
+async def lead_maestro(lead_id: int, request: Request):
+    """Bearer API_TOKEN. Ultima foto del maestro para ese lead y sus eventos."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        lead = conn.execute("SELECT phone FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        row = lead and conn.execute("SELECT payload FROM maestro WHERE phone = ?", (lead["phone"],)).fetchone()
+        if not row:
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        ev = [{"event": r["event"], "payload": _loads(r["payload"]), "ts": r["ts"]} for r in conn.execute(
+            "SELECT event, payload, ts FROM maestro_eventos WHERE phone = ? ORDER BY ts, id", (lead["phone"],))]
+        return {"payload": _loads(row["payload"]), "eventos": ev}
+    finally:
+        conn.close()
+
+
+# ---------- Gasto de Meta Ads (captura manual desde el panel) ----------
+_FECHA = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+@app.get("/gasto")
+async def list_gasto(request: Request):
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute("SELECT * FROM gasto ORDER BY desde DESC, id DESC")]
+    conn.close()
+    return rows
+
+
+@app.post("/gasto")
+async def add_gasto(request: Request):
+    """Bearer API_TOKEN. Body {campana, desde: YYYY-MM-DD, hasta: YYYY-MM-DD, monto}."""
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    campana = str(data.get("campana") or "").strip()
+    desde, hasta = str(data.get("desde") or ""), str(data.get("hasta") or "")
+    monto = _num(data.get("monto"))
+    if not campana or not _FECHA.match(desde) or not _FECHA.match(hasta) or desde > hasta or not monto or monto <= 0:
+        return JSONResponse({"detail": "campana, desde <= hasta (YYYY-MM-DD) y monto > 0 son obligatorios"}, status_code=400)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute("INSERT INTO gasto (campana, desde, hasta, monto, creado_por) VALUES (?, ?, ?, ?, ?)",
+                           (campana[:120], desde, hasta, monto, _env("LOGIN_USER") or "panel"))
+        conn.commit()
+        return dict(conn.execute("SELECT * FROM gasto WHERE id = ?", (cur.lastrowid,)).fetchone())
+    finally:
+        conn.close()
+
+
+@app.delete("/gasto/{gasto_id}")
+async def del_gasto(gasto_id: int, request: Request):
+    if not _bearer_ok(request, "API_TOKEN"):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        n = conn.execute("DELETE FROM gasto WHERE id = ?", (gasto_id,)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    if not n:
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    return {"deleted": gasto_id}
