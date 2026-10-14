@@ -8,6 +8,16 @@ import sqlite3
 
 app = FastAPI()
 
+# CORS: dominios del panel (Webflow). Configurable con CORS_ORIGINS separado por comas.
+from fastapi.middleware.cors import CORSMiddleware
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://prueba-carsmid.webflow.io").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
 VERIFY_TOKEN = "carsmid_wh_2026_x7k9"
 DB_PATH = os.environ.get("DB_PATH", "leads.db")
 
