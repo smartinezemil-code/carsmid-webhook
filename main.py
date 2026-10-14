@@ -9,7 +9,7 @@ import sqlite3
 app = FastAPI()
 
 VERIFY_TOKEN = "carsmid_wh_2026_x7k9"
-DB_PATH = "leads.db"
+DB_PATH = os.environ.get("DB_PATH", "leads.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
