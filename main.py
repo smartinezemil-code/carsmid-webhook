@@ -66,7 +66,11 @@ def init_db():
         ("motivo", "TEXT"),              # motivo de cancelacion
         ("nota_motivo", "TEXT"),
         ("vendedor", "TEXT"),
-        ("auto_interes", "TEXT"),
+        ("auto_interes", "TEXT"),        # texto armado: "Nissan Versa 2020"
+        ("auto_marca", "TEXT"),
+        ("auto_modelo", "TEXT"),
+        ("auto_anio", "INTEGER"),
+        ("auto_precio", "REAL"),
         ("actualizado_en", "DATETIME"),
         ("actualizado_por", "TEXT"),
     ])
@@ -393,6 +397,13 @@ async def lead_history(lead_id: int, request: Request):
 
 
 # ---------- Panel maestro (Cloudflare Worker) -> backend ----------
+def _num(v):
+    try:
+        return float(str(v).replace(",", "").replace("$", "")) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _guardar_sin_lead(conn, tipo, phone, data):
     conn.execute("INSERT INTO avisos_sin_lead (tipo, phone, payload) VALUES (?, ?, ?)",
                  (tipo, phone, json.dumps(data, ensure_ascii=False)))
@@ -401,8 +412,10 @@ def _guardar_sin_lead(conn, tipo, phone, data):
 @app.post("/estatus")
 async def recibir_estatus(request: Request):
     """Bearer VENTAS_TOKEN (token del panel maestro).
-    Body JSON {telefono, estatus, motivo?, nota?, cambiado_por?, vendedor?, auto_interes?, nombre?, campana?}.
-    Refleja el estatus del panel maestro en el lead de ese telefono."""
+    Body JSON {telefono, estatus?, motivo?, nota?, cambiado_por?, vendedor?, nombre?, campana?,
+               auto?: {marca, modelo, anio, precio}}.
+    Refleja en el lead de ese telefono el estatus y el auto de interes que tiene el panel maestro.
+    Sin "estatus" solo actualiza los demas datos (por ejemplo, al asignar el auto)."""
     if not _env("VENTAS_TOKEN"):
         return JSONResponse({"detail": "Not configured"}, status_code=500)
     if not _bearer_ok(request, "VENTAS_TOKEN"):
@@ -414,8 +427,8 @@ async def recibir_estatus(request: Request):
     phone = normalize_phone(data.get("telefono") or data.get("phone"))
     if len(phone) != 10:
         return JSONResponse({"detail": "telefono must have 10 digits"}, status_code=400)
-    estatus = str(data.get("estatus") or "").strip().lower()
-    if estatus not in ESTATUS:
+    estatus = str(data.get("estatus") or "").strip().lower() or None
+    if estatus is not None and estatus not in ESTATUS:
         return JSONResponse({"detail": "Invalid estatus", "allowed": ESTATUS}, status_code=400)
     motivo = str(data.get("motivo") or "").strip().lower() or None
     nota = str(data.get("nota") or "").strip() or None
@@ -437,17 +450,30 @@ async def recibir_estatus(request: Request):
             conn.commit()
             return {"matched": False, "telefono": phone}
         lead_id = lead["id"]
-        _set_result(conn, lead_id, estatus, quien, source="panel_maestro", motivo=motivo)
-        extras = {"motivo": motivo, "nota_motivo": nota}
-        for campo, clave in (("vendedor", "vendedor"), ("auto_interes", "auto_interes"),
-                             ("name", "nombre"), ("campaign", "campana")):
+        extras = {}
+        if estatus:
+            _set_result(conn, lead_id, estatus, quien, source="panel_maestro", motivo=motivo)
+            extras.update({"motivo": motivo, "nota_motivo": nota})
+        for campo, clave in (("vendedor", "vendedor"), ("name", "nombre"), ("campaign", "campana")):
             v = str(data.get(clave) or "").strip()
             if v:
                 extras[campo] = v
+        auto = data.get("auto") if isinstance(data.get("auto"), dict) else {}
+        marca = str(auto.get("marca") or data.get("auto_marca") or "").strip() or None
+        modelo = str(auto.get("modelo") or data.get("auto_modelo") or "").strip() or None
+        anio = _num(auto.get("anio", auto.get("año", data.get("auto_anio"))))
+        precio = _num(auto.get("precio", data.get("auto_precio")))
+        texto = str(data.get("auto_interes") or "").strip() or None
+        if marca or modelo or anio or precio or texto:
+            extras.update({"auto_marca": marca, "auto_modelo": modelo,
+                           "auto_anio": int(anio) if anio else None, "auto_precio": precio,
+                           "auto_interes": texto or " ".join(str(x) for x in (marca, modelo, int(anio) if anio else None) if x) or None})
+        if not extras:
+            return JSONResponse({"detail": "Nothing to update"}, status_code=400)
         sets = ", ".join(f"{k} = ?" for k in extras)
         conn.execute(f"UPDATE leads SET {sets} WHERE id = ?", (*extras.values(), lead_id))
         conn.commit()
-        return {"matched": True, "telefono": phone, "lead_id": lead_id, "estatus": estatus}
+        return {"matched": True, "telefono": phone, "lead_id": lead_id, "estatus": estatus or lead["result"]}
     finally:
         conn.close()
 
